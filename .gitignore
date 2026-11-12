@@ -11,3 +11,6 @@ checkpoints/*
 
 # Local testing harness (machine-specific paths, real video files, all test outputs)
 local_test/
+assets/*
+test_samples/*
+.trae/

@@ -1,5 +1,8 @@
 from huggingface_hub import hf_hub_download
-from modelscope import snapshot_download
+try:
+    from modelscope import snapshot_download
+except ImportError:
+    snapshot_download = None
 import os, shutil
 from typing_extensions import Literal, TypeAlias
 from typing import List

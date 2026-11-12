@@ -45,6 +45,18 @@ bash scripts/download_checkpoints.sh   # idv2v.pth + SAM3 + Wan2.1's T5 + VAE + 
 
 This fetches the **`idv2v.pth`** checkpoint (from [`Eyeline-Labs/ID-V2V`](https://huggingface.co/Eyeline-Labs/ID-V2V) → `checkpoints/idv2v.pth`) plus SAM3 and Wan2.1's T5 + VAE + tokenizer + CLIP — everything the default model needs. (Add `--skip-idv2v` if you already have the checkpoint, and set `MODEL_CHECKPOINT` to point at it.) See [`checkpoints/README.md`](checkpoints/README.md) for per-file sources.
 
+### ⚠️ Local deployment on RTX 5090 (Blackwell sm_120)
+
+The README above describes the official "one `uv` venv for everything" path built around torch 2.6+cu118 / A100 (sm_80). **Blackwell sm_120 GPUs are not supported by torch 2.6** (it tops out at sm_90), so the torch stack must be upgraded to **2.7.0+cu128**. Three things matter:
+
+| item | official README | 231 server reality |
+|---|---|---|
+| torch + CUDA | 2.6+cu118 | **2.7.0+cu128** (sm_120 hard requirement) |
+| env layout | one `uv` venv for preprocessing + inference | **two conda envs**: `idv2v` (Python 3.10, ships with `sam2`, runs preprocessing) + `hyavatar` (Python 3.11, Blackwell-ready, runs inference). Forcing them together means either compiling `sam2` from source in hyavatar (slow C-extension build) or rebuilding the stale `flash-attn` in idv2v — both have low ROI |
+| SAM checkpoint | SAM3 (`facebook/sam3` HF repo) | the code actually calls **SAM2.1** (`sam2.1_hiera_base_plus.pt`, under `checkpoints/VACE-Annotators/sam2/`); "SAM3" in the README is the generic product name |
+
+Also note: on 231 the checkpoint lives on NFS (`/nfs-data/`, local `/` ran out of space), `STAGE_CHECKPOINT_TO_SHM=false` (73 GB checkpoint would blow the 126 GB `/dev/shm`), and you need `swapoff -a` + `vm.max_map_count=16777216` before running. Walkthroughs and pitfalls: [new_video_inference_guide.md](new_video_inference_guide.md) and [deploy_progress.md](deploy_progress.md).
+
 # &#127916; Model inference
 
 The ID-V2V model takes a **source video**, a **stylized first frame** (the look you want), an optional set of **keyframes**, and a **text prompt**, and generates a stylized video that follows the keyframe(s) while preserving the source's identity and performance. Running it is two steps: a **preprocessing** pass that derives the control signal from the source, followed by the **generation** step. Generation runs at 720p.
@@ -67,11 +79,11 @@ my_sample/
 
 ## Preprocessing
 
-The default `idv2v` model conditions on a single control signal — **foreground-on-gray pixels** (the person segmented by SAM3, background grayed out). Derive it with:
+The default `idv2v` model conditions on a single control signal — **foreground-on-gray pixels** (the person segmented by SAM3 (the code actually uses **SAM2.1**, see the deployment note above), background grayed out). Derive it with:
 
 ```bash
 # SAMPLE_DIR is the input directory (here the bundled restylization example; use your own laid out like my_sample/ above).
-# SAM_PROMPT is the SAM3 text prompt for what to segment (default "person"; e.g. "head", "dog"):
+# SAM_PROMPT is the SAM3 (SAM2.1-backed) text prompt for what to segment (default "person"; e.g. "head", "dog"):
 SAMPLE_DIR=test_samples/restylization/two_sitting_woman SAM_PROMPT=person bash scripts/preprocess.sh
 ```
 
@@ -89,8 +101,12 @@ SAMPLE_DIR=test_samples/restylization/two_sitting_woman bash scripts/infer.sh
 - **Keyframes** are auto-discovered from `<SAMPLE_DIR>/keyframes/<N>.png`.
 - **`MAX_NUM_FRAMES`** caps the output length. The video is generated in overlapping 81-frame clips (`NUM_FRAMES_PER_CLIP=81`), so a longer source simply produces more clips — no separate long-video mode.
 - The checkpoint is memory-mapped on load, so all GPUs share one copy. `STAGE_CHECKPOINT_TO_SHM=true` (default) first copies the `.pth` into `/dev/shm` (RAM) for a big speedup on slow/network storage; it needs free RAM ≥ the checkpoint size — set it `false` if you hit CPU out-of-memory.
+- **Timing** (single RTX 5090, 30 steps): one 81-frame clip ≈ 50 min; 240 frames (3 clips) ≈ 3.5 h. Per-step time rises from ~98 s to ~140 s once multiple clips are in play.
+- **Aspect ratio**: output resolution is fixed at 1280×720, so a portrait source (e.g. 768×1344) is center-cropped and loses its top/bottom area. The side-by-side comparison video now accepts mixed aspect ratios (common height, no distortion) instead of raising an error.
 
 > The run prints a benign `diffsynth` warning (`using --use_multi_control_vace but only 1 control conditions is provided`). This is expected and safe to ignore.
+
+> For the local 231-server / RTX 5090 deployment (full workflow, pitfalls, parameter notes), see [new_video_inference_guide.md](new_video_inference_guide.md) and [deploy_progress.md](deploy_progress.md).
 
 ## Output structure
 

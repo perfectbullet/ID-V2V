@@ -18,13 +18,22 @@ source .venv/bin/activate
 # e.g. `SAMPLE_DIR=... bash scripts/preprocess.sh`). See checkpoints/README.md.
 # ====================================================================
 SAMPLE_DIR="${SAMPLE_DIR:-test_samples/restylization/two_sitting_woman}"   # dir containing source.mp4
-# Default assumes you ran `bash scripts/download_checkpoints.sh`. Override if needed.
-SAM3_CKPT="${SAM3_CKPT:-checkpoints/sam3}"
+# Default assumes you ran `bash scripts/download_checkpoints.sh` (and optionally symlinked
+# SAM 2.1 weights from /data/chenna/BadgeGroove-OOD-Seg/). Override if needed.
+# Match checkpoint to its Hydra config:
+#   sam2.1_hiera_base_plus.pt (309M) ↔ configs/sam2.1/sam2.1_hiera_b+.yaml
+#   sam2.1_hq_hiera_large.pt (858M) ↔ no HQ config in pip sam2 — don't use
+SAM2_CKPT="${SAM2_CKPT:-checkpoints/VACE-Annotators/sam2/sam2.1_hiera_base_plus.pt}"
+# Built-in Hydra config (pip-installed sam2 ships pkg://sam2/configs/sam2.1/*.yaml).
+# Pass as "configs/<subdir>/<name>.yaml" — Hydra resolves inside pkg://sam2.
+SAM2_CFG="${SAM2_CFG:-configs/sam2.1/sam2.1_hiera_b+.yaml}"
 GPU_ID="${GPU_ID:-0}"
 
 # Optional
-SAM_PROMPT="${SAM_PROMPT:-person}"   # SAM3 text prompt = what to segment: "person" (default), "head", "dog", ...
 CLEANUP=true          # delete per-frame frame_*/ folders after pipeline finishes
+MIN_AREA_RATIO="${MIN_AREA_RATIO:-0.005}"   # discard masks smaller than 0.5% of frame
+MAX_AREA_RATIO="${MAX_AREA_RATIO:-0.95}"    # discard masks larger than 95% of frame
+TOP_N="${TOP_N:-5}"                         # keep at most 5 largest masks per frame
 
 SOURCE_VIDEO="${SAMPLE_DIR}/source.mp4"
 PREPROC_DIR="${SAMPLE_DIR}/preprocessing"
@@ -32,13 +41,15 @@ mkdir -p "$PREPROC_DIR"
 
 export CUDA_VISIBLE_DEVICES=$GPU_ID
 
-# Step 1: SAM3 segmentation + Secret Panda mask cleanup
-python -m idv2v.preprocess.sam3 \
+# Step 1: SAM 2.1 automatic segmentation + Secret Panda mask cleanup
+python -m idv2v.preprocess.sam2_preprocess \
     --video_path "$SOURCE_VIDEO" \
-    --sam_prompt "$SAM_PROMPT" \
     --output_dir "$PREPROC_DIR" \
-    --model_path "$SAM3_CKPT" \
-    --joint_mask_post_proc
+    --model_path "$SAM2_CKPT" \
+    --config_path "$SAM2_CFG" \
+    --min_area_ratio "$MIN_AREA_RATIO" \
+    --max_area_ratio "$MAX_AREA_RATIO" \
+    --top_n "$TOP_N"
 
 # Step 2: foreground-on-gray — the single VACE condition idv2v consumes
 python -m idv2v.preprocess.orig_pixel \

@@ -30,6 +30,7 @@ type(_tx).__getattr__ = _patched_tx_getattr
 # --- end shims ---
 
 import time
+import mmap as _mmap
 import torch
 import numpy as np
 import imageio
@@ -45,21 +46,33 @@ import shutil
 import sys
 
 def ensure_ffmpeg_installed():
-    """Check if ffmpeg/ffprobe are available, install via apt if missing.
+    """Check if ffmpeg/ffprobe are available; if missing, try common system paths
+    and fall back to apt (only if run as root / with sudo).
 
-    All progress messages (and apt's own output) go to STDERR, not stdout, on
-    purpose: scripts/infer.sh resolves this module's path with
-    `PIPELINE="$(python -c 'import idv2v.inference.pipeline as m; print(m.__file__)')"`,
-    and that command substitution captures stdout. If the first-run install
-    messages went to stdout they would contaminate $PIPELINE and torchrun would
-    get a garbage file path. Running this at import time (before torchrun) also
-    means ffmpeg is installed once, single-process, so the parallel ranks never
-    race on `apt`.
+    We also explicitly add /usr/bin and /usr/local/bin to PATH before falling
+    back to apt — some venv setups (especially when activated inside scripts
+    that then `cd` into a non-standard cwd) can drop these directories.
     """
-    if shutil.which("ffprobe") is None or shutil.which("ffmpeg") is None:
-        print("ffmpeg/ffprobe not found. Installing via apt...", file=sys.stderr)
-        subprocess.run(["apt", "install", "-y", "ffmpeg"], check=True, stdout=sys.stderr)
-        print("ffmpeg installed successfully.", file=sys.stderr)
+    import os as _os
+    for _p in ("/usr/bin/ffmpeg", "/usr/bin/ffprobe",
+               "/usr/local/bin/ffmpeg", "/usr/local/bin/ffprobe",
+               "/bin/ffmpeg", "/bin/ffprobe"):
+        if _os.path.isfile(_p) and _os.access(_p, _os.X_OK):
+            _os.environ["PATH"] = _os.environ.get("PATH", "") + f":{_os.path.dirname(_p)}"
+            break
+
+    _ff = shutil.which("ffmpeg")
+    _fp = shutil.which("ffprobe")
+    if _ff is None or _fp is None:
+        # Final attempt: try apt if we're root
+        if _os.geteuid() == 0:
+            print("ffmpeg/ffprobe not found. Installing via apt...", file=sys.stderr)
+            subprocess.run(["apt", "install", "-y", "ffmpeg"], check=True, stdout=sys.stderr)
+        else:
+            raise RuntimeError(
+                f"ffmpeg/ffprobe not found (which: ffmpeg={_ff}, ffprobe={_fp}). "
+                "Install with: sudo apt install -y ffmpeg   (or conda install -c conda-forge ffmpeg)"
+            )
 
 ensure_ffmpeg_installed()
 
@@ -169,24 +182,19 @@ def stack_videos_left_right_and_save(video_paths: List[str], save_path: str, fps
               f". Using the minimal frame count: {min(lengths)}.")
     n_frames = min(lengths)
 
-    tol = 0.15
     first_frames = [vd[0].convert("RGB") for vd in vds]
     sizes = [im.size for im in first_frames]
     ars = [w / h for (w, h) in sizes]
 
-    if max(ars) - min(ars) > tol:
-        raise ValueError(f"Videos do not share the same aspect ratio (tol={tol}). "
-                         f"Got sizes={sizes}, ARs={[round(a,6) for a in ars]}.")
+    # 允许横竖屏混排：统一高度、各自按原始比例缩放，再横向拼接（不拉伸变形）
+    # yuv420p/libx264 要求宽高为偶数
+    target_h = min(h for (_, h) in sizes) // 2 * 2
+    per_video_w = [max(2, int(round(w * target_h / h)) // 2 * 2) for (w, h) in sizes]
 
-    areas = [w * h for (w, h) in sizes]
-    smallest_idx = int(np.argmin(areas))
-    target_size = sizes[smallest_idx]
-
-    if any(sz != target_size for sz in sizes):
-        print("[Warning] Videos have different sizes but same aspect ratio. "
-              f"Sizes={sizes}. Resizing all to the smallest size {target_size}.")
-
-    target_w, target_h = target_size
+    if len(set(sizes)) != 1:
+        print("[Warning] Videos have different sizes/aspect ratios: "
+              f"Sizes={sizes}, ARs={[round(a,6) for a in ars]}. "
+              f"Scaling all to height={target_h} per-video widths={per_video_w}.")
 
     if fps is None:
         fps = _infer_fps_or_default(video_paths[0])
@@ -194,16 +202,15 @@ def stack_videos_left_right_and_save(video_paths: List[str], save_path: str, fps
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
     writer = imageio.get_writer(save_path, fps=fps, macro_block_size=None)
     try:
-        resized0 = [im if im.size == target_size else im.resize(target_size, Image.BILINEAR)
-                    for im in first_frames]
-        stacked0 = np.concatenate([np.asarray(im) for im in resized0], axis=1)
-        writer.append_data(stacked0)
+        def _fit(im, idx):
+            tgt = (per_video_w[idx], target_h)
+            return im if im.size == tgt else im.resize(tgt, Image.BILINEAR)
+
+        writer.append_data(np.concatenate([np.asarray(_fit(im, i)) for i, im in enumerate(first_frames)], axis=1))
 
         for i in range(1, n_frames):
             imgs = [vd[i].convert("RGB") for vd in vds]
-            imgs = [im if im.size == (target_w, target_h) else im.resize((target_w, target_h), Image.BILINEAR)
-                    for im in imgs]
-            stacked = np.concatenate([np.asarray(img) for img in imgs], axis=1)
+            stacked = np.concatenate([np.asarray(_fit(im, j)) for j, im in enumerate(imgs)], axis=1)
             writer.append_data(stacked)
     finally:
         writer.close()
@@ -507,7 +514,14 @@ def _load_finetuned_dit_vace(pipe, checkpoint_path, torch_dtype=torch.bfloat16):
     if checkpoint_path.endswith((".safetensors", ".sft")):
         state_dict = load_state_dict(checkpoint_path)
     else:
-        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True, mmap=True)
+        # mmap=True: checkpoint stays file-backed; OS pages in on demand.
+        # MAP_SHARED (not the PyTorch 2.6 default MAP_PRIVATE) is required here because
+        # MAP_PRIVATE fails to map a ~73GB file with "Cannot allocate memory (12)" on
+        # machines where the kernel can't pre-COW such a large private region.
+        # MAP_SHARED lets all GPUs share one page-cache copy (critical for multi-GPU USP).
+        # Also requires vm.max_map_count >= 16777216 on host.
+        with torch.serialization.set_default_mmap_options(_mmap.MAP_SHARED):
+            state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True, mmap=True)
     print(f"  Checkpoint loaded in {time.time() - start_time:.1f}s")
 
     state_dict_vace = {k: v for k, v in state_dict.items() if "vace" in k}
